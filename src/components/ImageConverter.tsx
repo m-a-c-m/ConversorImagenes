@@ -53,6 +53,38 @@ function buildIco(canvases: HTMLCanvasElement[]): Blob {
   return new Blob([buffer], { type: "image/x-icon" });
 }
 
+function canvasToBmp(canvas: HTMLCanvasElement): Blob {
+  const ctx = canvas.getContext("2d")!;
+  const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const rowSize = Math.floor((24 * width + 31) / 32) * 4;
+  const pixelDataSize = rowSize * height;
+  const buffer = new ArrayBuffer(54 + pixelDataSize);
+  const view = new DataView(buffer);
+  const px = new Uint8Array(buffer);
+
+  view.setUint8(0, 0x42); view.setUint8(1, 0x4d);
+  view.setUint32(2, 54 + pixelDataSize, true);
+  view.setUint32(10, 54, true);
+  view.setUint32(14, 40, true);
+  view.setInt32(18, width, true);
+  view.setInt32(22, height, true);
+  view.setUint16(26, 1, true);
+  view.setUint16(28, 24, true);
+  view.setUint32(34, pixelDataSize, true);
+  view.setInt32(38, 2835, true);
+  view.setInt32(42, 2835, true);
+
+  for (let y = 0; y < height; y++) {
+    const srcRow = height - 1 - y;
+    for (let x = 0; x < width; x++) {
+      const s = (srcRow * width + x) * 4;
+      const d = 54 + y * rowSize + x * 3;
+      px[d] = data[s + 2]; px[d + 1] = data[s + 1]; px[d + 2] = data[s];
+    }
+  }
+  return new Blob([buffer], { type: "image/bmp" });
+}
+
 export default function ImageConverter() {
   const [srcDataUrl, setSrcDataUrl] = useState<string | null>(null);
   const [srcInfo, setSrcInfo] = useState<{ w: number; h: number; size: number; name: string } | null>(null);
@@ -161,7 +193,13 @@ export default function ImageConverter() {
           const c = document.createElement("canvas");
           c.width = size;
           c.height = size;
-          c.getContext("2d")!.drawImage(img, 0, 0, size, size);
+          const ctx = c.getContext("2d")!;
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          const scale = Math.min(size / img.width, size / img.height);
+          const dw = Math.round(img.width * scale);
+          const dh = Math.round(img.height * scale);
+          ctx.drawImage(img, Math.round((size - dw) / 2), Math.round((size - dh) / 2), dw, dh);
           return c;
         });
 
@@ -177,11 +215,22 @@ export default function ImageConverter() {
       canvas.width = outW;
       canvas.height = outH;
       const ctx = canvas.getContext("2d")!;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       if (format === "jpg") {
         ctx.fillStyle = "#ffffff";
         ctx.fillRect(0, 0, outW, outH);
       }
       ctx.drawImage(img, 0, 0, outW, outH);
+
+      if (format === "bmp") {
+        const blob = canvasToBmp(canvas);
+        const url = URL.createObjectURL(blob);
+        setResultDataUrl(url);
+        setResultBlob(blob);
+        setResultInfo({ w: outW, h: outH, size: blob.size, format: "BMP" });
+        return;
+      }
 
       const mimeMap: Record<OutputFormat, string> = {
         png: "image/png",
