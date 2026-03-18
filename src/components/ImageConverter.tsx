@@ -1,6 +1,10 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
+
+interface Props {
+  locale?: string;
+}
 
 type OutputFormat = "png" | "jpg" | "webp" | "avif" | "bmp" | "ico";
 
@@ -28,8 +32,9 @@ function buildIco(canvases: HTMLCanvasElement[]): Blob {
   const view = new DataView(buffer);
   const bytes = new Uint8Array(buffer);
 
-  view.setUint16(0, 0, true);
-  view.setUint16(2, 1, true);
+  // ICONDIR
+  view.setUint16(0, 0, true); // reserved
+  view.setUint16(2, 1, true); // type = 1 (ICO)
   view.setUint16(4, count, true);
 
   let currentOffset = dataOffset;
@@ -37,14 +42,15 @@ function buildIco(canvases: HTMLCanvasElement[]): Blob {
     const size = canvases[i].width;
     const dirBase = headerSize + i * dirEntrySize;
 
-    view.setUint8(dirBase + 0, size >= 256 ? 0 : size);
-    view.setUint8(dirBase + 1, size >= 256 ? 0 : size);
-    view.setUint8(dirBase + 2, 0);
-    view.setUint8(dirBase + 3, 0);
-    view.setUint16(dirBase + 4, 0, true);
-    view.setUint16(dirBase + 6, 32, true);
-    view.setUint32(dirBase + 8, png.length, true);
-    view.setUint32(dirBase + 12, currentOffset, true);
+    // ICONDIRENTRY
+    view.setUint8(dirBase + 0, size >= 256 ? 0 : size); // width (0 = 256)
+    view.setUint8(dirBase + 1, size >= 256 ? 0 : size); // height
+    view.setUint8(dirBase + 2, 0); // color count
+    view.setUint8(dirBase + 3, 0); // reserved
+    view.setUint16(dirBase + 4, 0, true); // color planes
+    view.setUint16(dirBase + 6, 32, true); // bits per pixel
+    view.setUint32(dirBase + 8, png.length, true); // size
+    view.setUint32(dirBase + 12, currentOffset, true); // offset
 
     bytes.set(png, currentOffset);
     currentOffset += png.length;
@@ -53,27 +59,33 @@ function buildIco(canvases: HTMLCanvasElement[]): Blob {
   return new Blob([buffer], { type: "image/x-icon" });
 }
 
+// Native canvas.toBlob("image/bmp") is not supported in most browsers.
+// This encoder writes a valid 24-bit BMP (bottom-up, no compression).
 function canvasToBmp(canvas: HTMLCanvasElement): Blob {
   const ctx = canvas.getContext("2d")!;
   const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const rowSize = Math.floor((24 * width + 31) / 32) * 4;
+  const rowSize = Math.floor((24 * width + 31) / 32) * 4; // padded to 4 bytes
   const pixelDataSize = rowSize * height;
   const buffer = new ArrayBuffer(54 + pixelDataSize);
   const view = new DataView(buffer);
   const px = new Uint8Array(buffer);
 
-  view.setUint8(0, 0x42); view.setUint8(1, 0x4d);
+  // File header
+  view.setUint8(0, 0x42); view.setUint8(1, 0x4d); // 'BM'
   view.setUint32(2, 54 + pixelDataSize, true);
-  view.setUint32(10, 54, true);
-  view.setUint32(14, 40, true);
-  view.setInt32(18, width, true);
-  view.setInt32(22, height, true);
-  view.setUint16(26, 1, true);
-  view.setUint16(28, 24, true);
-  view.setUint32(34, pixelDataSize, true);
-  view.setInt32(38, 2835, true);
-  view.setInt32(42, 2835, true);
+  view.setUint32(10, 54, true); // pixel data offset
 
+  // DIB header (BITMAPINFOHEADER)
+  view.setUint32(14, 40, true);      // header size
+  view.setInt32(18, width, true);
+  view.setInt32(22, height, true);   // positive = bottom-up rows
+  view.setUint16(26, 1, true);       // color planes
+  view.setUint16(28, 24, true);      // 24 bpp
+  view.setUint32(34, pixelDataSize, true);
+  view.setInt32(38, 2835, true);     // ~72 DPI X
+  view.setInt32(42, 2835, true);     // ~72 DPI Y
+
+  // Pixel data — BGR, rows stored bottom-to-top
   for (let y = 0; y < height; y++) {
     const srcRow = height - 1 - y;
     for (let x = 0; x < width; x++) {
@@ -85,7 +97,9 @@ function canvasToBmp(canvas: HTMLCanvasElement): Blob {
   return new Blob([buffer], { type: "image/bmp" });
 }
 
-export default function ImageConverter() {
+export default function ImageConverter({ locale }: Props) {
+  const isEs = locale !== "en";
+
   const [srcDataUrl, setSrcDataUrl] = useState<string | null>(null);
   const [srcInfo, setSrcInfo] = useState<{ w: number; h: number; size: number; name: string } | null>(null);
   const [format, setFormat] = useState<OutputFormat>("webp");
@@ -131,6 +145,17 @@ export default function ImageConverter() {
     };
     reader.readAsDataURL(f);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const file = Array.from(e.clipboardData?.items ?? [])
+        .find((i) => i.type.startsWith("image/"))
+        ?.getAsFile();
+      if (file) loadFile(file);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [loadFile]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -196,6 +221,7 @@ export default function ImageConverter() {
           const ctx = c.getContext("2d")!;
           ctx.imageSmoothingEnabled = true;
           ctx.imageSmoothingQuality = "high";
+          // Letterbox: fit inside square maintaining aspect ratio
           const scale = Math.min(size / img.width, size / img.height);
           const dw = Math.round(img.width * scale);
           const dh = Math.round(img.height * scale);
@@ -223,6 +249,7 @@ export default function ImageConverter() {
       }
       ctx.drawImage(img, 0, 0, outW, outH);
 
+      // BMP: canvas.toBlob doesn't support image/bmp — use custom encoder
       if (format === "bmp") {
         const blob = canvasToBmp(canvas);
         const url = URL.createObjectURL(blob);
@@ -310,9 +337,13 @@ export default function ImageConverter() {
         >
           <div className="text-5xl opacity-60">🖼️</div>
           <div>
-            <p className="text-lg font-medium text-white">Arrastra tu imagen aquí</p>
+            <p className="text-lg font-medium text-white">
+              {isEs ? "Arrastra tu imagen aquí" : "Drop your image here"}
+            </p>
             <p className="mt-1 text-sm text-text-muted">
-              o haz clic para seleccionar — PNG, JPG, WebP, AVIF, BMP, GIF
+              {isEs
+                ? "o haz clic para seleccionar · o pega con Ctrl+V"
+                : "or click to select · or paste with Ctrl+V"}
             </p>
           </div>
           <input
@@ -332,7 +363,7 @@ export default function ImageConverter() {
           <div className="flex flex-col md:flex-row gap-6">
             <div className="flex-1 rounded-xl border border-border/20 bg-surface/40 p-4">
               <p className="mb-2 text-xs font-medium uppercase tracking-wider text-text-muted">
-                Original
+                {isEs ? "Original" : "Original"}
               </p>
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
@@ -351,7 +382,7 @@ export default function ImageConverter() {
             {resultDataUrl && resultInfo && (
               <div className="flex-1 rounded-xl border border-primary/20 bg-primary/5 p-4">
                 <p className="mb-2 text-xs font-medium uppercase tracking-wider text-primary">
-                  Resultado
+                  {isEs ? "Resultado" : "Result"}
                 </p>
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
@@ -367,7 +398,8 @@ export default function ImageConverter() {
                   {sizeDiff !== null && (
                     <p className={sizeDiff <= 0 ? "text-green-400" : "text-red-400"}>
                       {sizeDiff > 0 ? "+" : ""}
-                      {sizeDiff}% respecto al original
+                      {sizeDiff}%{" "}
+                      {isEs ? "respecto al original" : "vs original"}
                     </p>
                   )}
                 </div>
@@ -377,7 +409,9 @@ export default function ImageConverter() {
 
           {/* Format selector */}
           <div>
-            <p className="mb-2 text-sm font-medium text-white">Formato de salida</p>
+            <p className="mb-2 text-sm font-medium text-white">
+              {isEs ? "Formato de salida" : "Output format"}
+            </p>
             <div className="flex flex-wrap gap-2">
               {FORMATS.map((f) => (
                 <button
@@ -392,7 +426,7 @@ export default function ImageConverter() {
                   {f === "jpg" ? "JPG" : f.toUpperCase()}
                   {f === "avif" && (
                     <span className="rounded-full bg-purple-500/20 px-1.5 py-0.5 text-[10px] text-purple-400">
-                      Moderno
+                      {isEs ? "Moderno" : "Modern"}
                     </span>
                   )}
                 </button>
@@ -400,7 +434,9 @@ export default function ImageConverter() {
             </div>
             {avifUnsupported && (
               <p className="mt-2 text-xs text-red-400">
-                Tu navegador no soporta exportar AVIF. Prueba con Chrome 94+ o Edge 94+.
+                {isEs
+                  ? "Tu navegador no soporta exportar AVIF. Prueba con Chrome 94+ o Edge 94+."
+                  : "Your browser does not support exporting AVIF. Try Chrome 94+ or Edge 94+."}
               </p>
             )}
           </div>
@@ -409,7 +445,9 @@ export default function ImageConverter() {
           {(format === "jpg" || format === "webp") && (
             <div>
               <div className="mb-2 flex items-center justify-between">
-                <p className="text-sm font-medium text-white">Calidad</p>
+                <p className="text-sm font-medium text-white">
+                  {isEs ? "Calidad" : "Quality"}
+                </p>
                 <span className="text-sm font-bold text-primary">{quality}%</span>
               </div>
               <input
@@ -421,8 +459,8 @@ export default function ImageConverter() {
                 className="w-full accent-primary"
               />
               <div className="mt-1 flex justify-between text-xs text-text-muted/60">
-                <span>Menor peso</span>
-                <span>Mayor calidad</span>
+                <span>{isEs ? "Menor peso" : "Smaller file"}</span>
+                <span>{isEs ? "Mayor calidad" : "Higher quality"}</span>
               </div>
             </div>
           )}
@@ -430,7 +468,9 @@ export default function ImageConverter() {
           {/* ICO sizes */}
           {format === "ico" && (
             <div>
-              <p className="mb-2 text-sm font-medium text-white">Tamaños ICO</p>
+              <p className="mb-2 text-sm font-medium text-white">
+                {isEs ? "Tamaños ICO" : "ICO sizes"}
+              </p>
               <div className="flex flex-wrap gap-2">
                 {ICO_SIZES.map((size) => (
                   <button
@@ -447,7 +487,9 @@ export default function ImageConverter() {
                 ))}
               </div>
               <p className="mt-1 text-xs text-text-muted/60">
-                El .ico contendrá todas las resoluciones seleccionadas.
+                {isEs
+                  ? "El .ico contendrá todas las resoluciones seleccionadas."
+                  : "The .ico file will contain all selected resolutions."}
               </p>
             </div>
           )}
@@ -461,7 +503,9 @@ export default function ImageConverter() {
                 onChange={(e) => { setResizeEnabled(e.target.checked); clearResult(); }}
                 className="accent-primary"
               />
-              <span className="text-sm font-medium text-white">Redimensionar</span>
+              <span className="text-sm font-medium text-white">
+                {isEs ? "Redimensionar" : "Resize"}
+              </span>
             </label>
             {resizeEnabled && (
               <div className="mt-3 flex flex-wrap items-end gap-3">
@@ -478,7 +522,7 @@ export default function ImageConverter() {
                 <button
                   onClick={() => setRatioLocked((p) => !p)}
                   className="mb-1 text-xl"
-                  title="Bloquear proporción"
+                  title={isEs ? "Bloquear proporción" : "Lock ratio"}
                 >
                   {ratioLocked ? "🔒" : "🔓"}
                 </button>
@@ -503,21 +547,23 @@ export default function ImageConverter() {
               disabled={converting || (format === "ico" && icoSizes.length === 0)}
               className="flex-1 rounded-xl bg-primary px-6 py-3 text-sm font-semibold text-background transition-all hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {converting ? "Convirtiendo…" : "Convertir"}
+              {converting
+                ? isEs ? "Convirtiendo…" : "Converting…"
+                : isEs ? "Convertir" : "Convert"}
             </button>
             {resultBlob && (
               <button
                 onClick={download}
                 className="flex-1 rounded-xl border border-primary/40 bg-primary/10 px-6 py-3 text-sm font-semibold text-primary transition-all hover:bg-primary/20"
               >
-                Descargar
+                {isEs ? "Descargar" : "Download"}
               </button>
             )}
             <button
               onClick={reset}
               className="rounded-xl border border-border/30 px-6 py-3 text-sm text-text-muted transition-all hover:border-border/60 hover:text-white"
             >
-              Nueva imagen
+              {isEs ? "Nueva imagen" : "New image"}
             </button>
           </div>
         </div>
